@@ -39,8 +39,16 @@
 /*---------------------------------------------------------------------------*
 *  Includes
 *---------------------------------------------------------------------------*/
-#include "bno055.h"
+#include "bno055.c"
+#include <stdio.h>
+#include <unistd.h>				//Needed for I2C port
+#include <fcntl.h>				//Needed for I2C port
+#include <sys/ioctl.h>			//Needed for I2C port
+#include <linux/i2c.h>
+#include <linux/i2c-dev.h>		//Needed for I2C port
 
+
+#define BNO055_API 1
 /*----------------------------------------------------------------------------*
 *  The following APIs are used for reading and writing of
 *   sensor data using I2C communication
@@ -58,6 +66,7 @@
  *  \param cnt : The no of byte of data to be read
  */
 s8 BNO055_I2C_bus_read(u8 dev_addr, u8 reg_addr, u8 *reg_data, u8 cnt);
+s8 my_bno055_bus_read(u8 dev_addr, u8 reg_addr, u8 *reg_data, u8 cnt);
 
 /*  \Brief: The API is used as SPI bus write
  *  \Return : Status of the SPI write
@@ -69,6 +78,7 @@ s8 BNO055_I2C_bus_read(u8 dev_addr, u8 reg_addr, u8 *reg_data, u8 cnt);
  *  \param cnt : The no of byte of data to be write
  */
 s8 BNO055_I2C_bus_write(u8 dev_addr, u8 reg_addr, u8 *reg_data, u8 cnt);
+s8 my_bno055_bus_write(u8 dev_addr, u8 reg_addr, u8 *reg_data, u8 cnt);
 
 /*
  * \Brief: I2C init routine
@@ -101,6 +111,155 @@ s32 bno055_data_readout_template(void);
  *  Chip id of the sensor: chip_id
  *---------------------------------------------------------------------------*/
 struct bno055_t bno055;
+
+int file_i2c;
+
+/* Do all initialization of BNO055, then start calibration loop
+ *
+ * Return value of 0 indicates Error
+ * Return value of anything else indicates the I2C file active
+ */
+int init_and_calib_bno055(void)
+{
+    u8 power_mode_on = BNO055_POWER_MODE_NORMAL;
+    s32 init_res = BNO055_ERROR;
+    s32 power_on_res = BNO055_ERROR;
+    s32 comres = ((u8)2);
+    u8 d_sys_calib = ((u8)5);
+    u8 d_mag_calib = ((u8)5);
+    u8 d_gyro_calib = ((u8)5);
+    u8 d_accel_calib = ((u8)5);
+    u8 d_intr_rst = ((u8)3);
+    u8 op_mode = ((u8)3);
+
+    //----- OPEN THE I2C BUS -----
+    char *filename = (char*)"/dev/i2c-1";
+    if ((file_i2c = open(filename, O_RDWR)) < 0) {
+        printf("Failed to open the i2c bus\n");
+        return 0;
+    }
+
+    I2C_routine();
+    init_res = bno055_init(&bno055);
+    power_on_res = bno055_set_power_mode(power_mode_on);
+
+    if (init_res == BNO055_SUCCESS && power_on_res == BNO055_SUCCESS) {
+      printf("Successful setup of BNO055\n");
+    } else {
+      printf("Failed setup of BNO055\n");
+    }
+
+    /*start test op mode */
+    comres = bno055_get_operation_mode(&op_mode);
+    if(comres != BNO055_SUCCESS) {
+        printf("Failed to get op mode\n");
+    } else {
+        printf("Op mode is starting at %d\n", op_mode);
+    }
+
+    /* set to fusion fast magnetic calib off */
+    comres = bno055_set_operation_mode(BNO055_OPERATION_MODE_NDOF_FMC_OFF);
+    if (comres != BNO055_SUCCESS) {
+        printf("Failed to set BNO055 to NDOF_FMC_OFF mode\n");
+    }
+
+    comres = bno055_get_intr_rst(&d_intr_rst);
+    if (comres != BNO055_SUCCESS) {
+        printf("Failed to get intr rst\n");
+    } else {
+	printf("Intr rst val:%d\n", d_intr_rst);
+    }
+
+    while (d_sys_calib != 3) {
+
+	comres = bno055_get_mag_calib_stat(&d_mag_calib);
+	if (comres != BNO055_SUCCESS) {
+            printf("Failed to get mag calib\n");
+    	}
+	comres = bno055_get_accel_calib_stat(&d_accel_calib);
+	if (comres != BNO055_SUCCESS) {
+            printf("Failed to get accel calib\n");
+        }
+	comres = bno055_get_gyro_calib_stat(&d_gyro_calib);
+	if (comres != BNO055_SUCCESS) {
+            printf("Failed to get gyro calib\n");
+        }
+        comres = bno055_get_sys_calib_stat(&d_sys_calib);
+	if (comres != BNO055_SUCCESS) {
+            printf("Failed to get sys calib\n");
+        }
+	printf("BNO055 Calibration value is %d with mag:%d accel:%d gyro:%d\n", d_sys_calib, d_mag_calib, d_accel_calib, d_gyro_calib);
+	sleep(1);
+    }
+
+    printf("Calibration Successful!\n");
+    return file_i2c;
+}
+
+/* Obtain Formatted Data in BNO055 
+ *
+ * Probably going to specify some data return type AFTER verifying that C/C++ works as expected
+ * covering errors, and all data outputs expected
+ */
+// at first, let's have 1 indicate failure and 0 indicate success
+struct marae_data_t get_bno055_data(void) {
+    struct marae_data_t data;
+    u8 sys_calib;
+    struct bno055_quaternion_t quaternion_wxyz;
+    struct bno055_linear_accel_double_t d_linear_accel_xyz;
+    struct bno055_gyro_double_t d_gyro_xyz;
+    s32 comm;
+
+    //check that device is still calibrated (TODO, figure out, do I need this constant check?)
+    /*
+    comm = bno055_get_sys_calib_stat(&sys_calib);
+    if (comm != BNO055_SUCCESS) {
+        printf("Failed to get sys calib\n");
+	data.status = 1;
+        return data;
+    }
+    if (sys_calib != 3) {
+        printf("BNO055 is no longer fully calibrated! Now at %d/3\n", sys_calib);
+	data.status = 2;
+	return data;
+    }*/
+
+    //obtain all relevant motion data
+    comm = bno055_read_quaternion_wxyz(&quaternion_wxyz);
+    if (comm != BNO055_SUCCESS) {
+        printf("Failed to get quaternion value\n");
+	data.status = 3;
+	return data;
+    }
+    comm = bno055_convert_double_linear_accel_xyz_msq(&d_linear_accel_xyz);
+    if (comm != BNO055_SUCCESS) {
+        printf("Failed to get lin_accel value\n");
+        data.status = 4;
+	return data;
+    }
+    comm = bno055_convert_double_gyro_xyz_rps(&d_gyro_xyz);
+    if (comm != BNO055_SUCCESS) {
+        printf("Failed to get gyro value\n");
+        data.status = 5;
+	return data;
+    }
+
+    /* Everything succeeded! woop woop */
+    data.status = 0;
+    data.quaternion = quaternion_wxyz;
+    data.lin_accel = d_linear_accel_xyz;
+    data.ang_vel = d_gyro_xyz;
+    return data;
+}
+
+/* Safely shut down BNO055 
+ * 0 is success, 1 is failure */
+int close_bno055(void) {
+    u8 power_mode = BNO055_POWER_MODE_SUSPEND;
+    /* set the power mode as SUSPEND*/
+    return bno055_set_power_mode(power_mode);
+}
+
 
 /* This API is an example for reading sensor data
  *  \param: None
@@ -318,16 +477,54 @@ s32 bno055_data_readout_template(void)
      *-------------------------------------------------------------------------*/
     comres = bno055_init(&bno055);
 
+    u8 op_mode = ((u8)3);
+    u8 pow_mode = ((u8)10);
+    comres = bno055_get_operation_mode(&op_mode);
+    if (comres == BNO055_SUCCESS) {
+        printf("Get First Op Mode worked and resulted is %x\n", op_mode);
+    }
+
+    comres = bno055_get_power_mode(&pow_mode);
+    if (comres == BNO055_SUCCESS) {
+	printf("Get First Pow Mode worked and result is %d\n", pow_mode);
+    }
     /*  For initializing the BNO sensor it is required to the operation mode
      * of the sensor as NORMAL
      * Normal mode can set from the register
      * Page - page0
      * register - 0x3E
      * bit positions - 0 and 1*/
+
+
     power_mode = BNO055_POWER_MODE_NORMAL;
 
     /* set the power mode as NORMAL*/
     comres += bno055_set_power_mode(power_mode);
+
+    comres = bno055_get_power_mode(&pow_mode);
+    if (comres == BNO055_SUCCESS) {
+        printf("Get Second Pow Mode worked and result is %d\n", pow_mode);
+    }
+
+    comres = bno055_get_sys_stat_code(&pow_mode);
+    if (comres == BNO055_SUCCESS) {
+	printf("Sys status is %d\n", pow_mode);
+    }
+
+    comres = bno055_get_sys_error_code(&pow_mode);
+    if (comres == BNO055_SUCCESS) {
+        printf("Sys error is %d\n", pow_mode);
+    }
+
+    comres = bno055_get_operation_mode(&op_mode);
+    if (comres == BNO055_SUCCESS) {
+    	printf("Get Op Mode worked and resulted in %x\n", op_mode);
+    }
+
+    comres = bno055_set_power_mode(BNO055_POWER_MODE_SUSPEND);
+    if (comres != BNO055_SUCCESS) {
+        printf("Set Power to Suspend failed\n");
+    }
 
     /*----------------------------------------------------------------*
      ************************* END INITIALIZATION *************************
@@ -440,7 +637,7 @@ s32 bno055_data_readout_template(void)
     comres += bno055_read_gravity_y(&gravity_data_y);
     comres += bno055_read_gravity_z(&gravity_data_z);
     comres += bno055_read_gravity_xyz(&gravity_xyz);
-
+    
     /************************* END READ RAW FUSION DATA  ************/
     /******************START READ CONVERTED SENSOR DATA****************/
 
@@ -535,8 +732,8 @@ s32 bno055_data_readout_template(void)
  *--------------------------------------------------------------------------*/
 s8 I2C_routine(void)
 {
-    bno055.bus_write = BNO055_I2C_bus_write;
-    bno055.bus_read = BNO055_I2C_bus_read;
+    bno055.bus_write = my_bno055_bus_write;//BNO055_I2C_bus_write;
+    bno055.bus_read = my_bno055_bus_read;//BNO055_I2C_bus_read;
     bno055.delay_msec = BNO055_delay_msek;
     bno055.dev_addr = BNO055_I2C_ADDR1;
 
@@ -574,8 +771,11 @@ s8 BNO055_I2C_bus_write(u8 dev_addr, u8 reg_addr, u8 *reg_data, u8 cnt)
     array[BNO055_INIT_VALUE] = reg_addr;
     for (stringpos = BNO055_INIT_VALUE; stringpos < cnt; stringpos++)
     {
-        array[stringpos + BNO055_I2C_BUS_WRITE_ARRAY_INDEX] = *(reg_data + stringpos);
+        //array[stringpos] = *(reg_data + stringpos);
+	array[stringpos + BNO055_I2C_BUS_WRITE_ARRAY_INDEX] = *(reg_data + stringpos);
     }
+
+    return (s8)BNO055_iERROR;
 }
 
 /*
@@ -594,8 +794,8 @@ s8 BNO055_I2C_bus_write(u8 dev_addr, u8 reg_addr, u8 *reg_data, u8 cnt)
  * in the I2C write string function
  * For more information please refer data sheet SPI communication:
  */
-return (s8)BNO055_iERROR;
-}
+//return (s8)BNO055_iERROR;
+//}
 
 /*  \Brief: The API is used as I2C bus read
  *  \Return : Status of the I2C read
@@ -632,6 +832,67 @@ s8 BNO055_I2C_bus_read(u8 dev_addr, u8 reg_addr, u8 *reg_data, u8 cnt)
     return (s8)BNO055_iERROR;
 }
 
+/* personal implementation of i2c write of bno055 data */
+s8 my_bno055_bus_write(u8 dev_addr, u8 reg_addr, u8 *reg_data, u8 cnt)
+{
+    unsigned char outbuf[cnt+1];
+    struct i2c_rdwr_ioctl_data packets;
+    struct i2c_msg messages[1];
+    int i;
+
+    messages[0].addr = dev_addr;
+    messages[0].flags = 0;
+    messages[0].len = sizeof(outbuf);
+    messages[0].buf = outbuf;
+
+    outbuf[0] = reg_addr;
+    for (i = 1; i <= cnt; i++) {
+        outbuf[i] = *(reg_data + (i-1));
+    }
+
+    packets.msgs = messages;
+    packets.nmsgs = 1;
+    if(ioctl(file_i2c, I2C_RDWR, &packets) < 0) {
+	return 1;
+    }
+
+    /* succeeds */
+    return 0;
+}
+
+
+/* personal implementation of i2c read of bno055 data */
+s8 my_bno055_bus_read(u8 dev_addr, u8 reg_addr, u8 *reg_data, u8 cnt)
+{
+    unsigned char outbuf;
+    unsigned char inbuf[cnt];
+    struct i2c_rdwr_ioctl_data packets;
+    struct i2c_msg messages[2];
+    int i;
+
+    outbuf = reg_addr;
+    messages[0].addr = dev_addr;
+    messages[0].flags = 0;
+    messages[0].len = sizeof(outbuf);
+    messages[0].buf = &outbuf;
+
+    messages[1].addr = dev_addr;
+    messages[1].flags = I2C_M_RD;
+    messages[1].len = sizeof(inbuf);
+    messages[1].buf = inbuf;
+
+    packets.msgs = messages;
+    packets.nmsgs = 2;
+    if (ioctl(file_i2c, I2C_RDWR, &packets) < 0) {
+        return 1;
+    }
+
+    for (i = 0; i < cnt; i++) {
+        *(reg_data + i) = inbuf[i];
+    }
+    return 0;
+}
+
 /*  Brief : The delay routine
  *  \param : delay in ms
  */
@@ -641,3 +902,24 @@ void BNO055_delay_msek(u32 msek)
 }
 
 #endif
+/*
+int main(void)
+{
+  printf("Starting...\n");
+  int i;
+
+  s32 func_val;
+  func_val = init_and_calib_bno055();
+  printf("Init and Calib returned %d\n", func_val);
+
+  for (i=0; i< 200; i++) {
+      func_val = get_bno055_data();
+      printf("BNO055 func call returned %d\n", func_val);
+  }
+
+  func_val = close_bno055();
+  printf("BNO055 close func returned %d\n", func_val);
+  
+  return 0;
+}
+*/
